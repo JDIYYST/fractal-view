@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Fractal View</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;overscroll-behavior:none;
+    -webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+  canvas{position:fixed;left:0;top:0;width:100vw;height:100vh;display:block;touch-action:none}
+  #hud{position:fixed;left:max(10px,env(safe-area-inset-left));top:max(10px,env(safe-area-inset-top));
+    font:12px/1.55 ui-monospace,Menlo,monospace;color:#d6f2ea;background:rgba(0,0,0,.6);
+    padding:8px 10px;border-radius:8px;white-space:pre;max-width:86vw;z-index:2}
+  #hud.min #detail{display:none}
+  #hud button{font:inherit;margin-top:6px;background:#1d3330;color:#d6f2ea;border:1px solid #3d6660;
+    border-radius:5px;padding:2px 10px}
+  #msg{position:fixed;inset:0;display:none;align-items:center;justify-content:center;color:#ff9b9b;
+    font:16px/1.6 -apple-system,sans-serif;text-align:center;padding:24px;white-space:pre-line;z-index:3}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud" class="min"><div id="sum"></div><div id="detail"><div id="log"></div><button id="clr">清空记录</button></div></div>
+<div id="msg"></div>
+<script>
+(function () {
+'use strict';
+
+// 永不弹出阻塞对话框
+window.alert = window.confirm = window.prompt = function () {};
+
+// ---------- 参数（URL 上可覆盖，如 ?steps=128&fps=24&cpu=2） ----------
+var Q = new URLSearchParams(location.search);
+function num(k, d, lo, hi) {
+  var v = parseFloat(Q.get(k));
+  return isFinite(v) ? Math.min(hi, Math.max(lo, v)) : d;
+}
+var cfg = {
+  steps: Math.round(num('steps', 96, 16, 256)), // 每条光线的体积采样数
+  iter:  Math.round(num('iter', 8, 2, 16)),     // 分形迭代次数
+  fps:   num('fps', 12, 5, 60),                 // 自动调负载的目标帧率：压低到十几帧，避免帧与帧之间被垂直同步卡出 GPU 空闲
+  scale: Q.get('scale') ? num('scale', 0.5, 0.1, 1) : 0, // 固定渲染缩放；不填则自动
+  cpu:   Math.round(num('cpu', 0, 0, 8)),       // 额外 CPU 负载线程数，默认不开
+  hud:   Q.get('hud') !== '0'
+};
+
+// ---------- 本地存储（失败也不影响运行） ----------
+var LS = {
+  get: function (k, d) { try { var v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } },
+  set: function (k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} },
+  del: function (k) { try { localStorage.removeItem(k); } catch (e) {} }
+};
+if (Q.get('reset') === '1') ['vsr_log', 'vsr_open', 'vsr_reloads'].forEach(LS.del);
+
+// ---------- 运行时段记录（用来看每轮放电实际持续多久） ----------
+var seg = null;
+function pushLog(s, e, f) {
+  var log = LS.get('vsr_log', []);
+  log.push({ s: s, e: e, f: f || '' });
+  if (log.length > 80) log = log.slice(-80);
+  LS.set('vsr_log', log);
+}
+function segStart() { if (seg) return; var n = Date.now(); seg = { start: n, last: n }; LS.set('vsr_open', seg); }
+function segBeat() { if (!seg) return; seg.last = Date.now(); LS.set('vsr_open', seg); }
+function segEnd(f) { if (!seg) return; pushLog(seg.start, Date.now(), f); seg = null; LS.del('vsr_open'); }
+(function recover() { // 上次被系统杀掉/崩溃时没来得及收尾的时段
+  var o = LS.get('vsr_open', null);
+  if (o && o.start && o.last > o.start) pushLog(o.start, o.last, '中断');
+  LS.del('vsr_open');
+})();
+
+// ---------- 自动重载（带退避，防止无限快速刷新） ----------
+var reloadTimer = 0;
+function reloadSoon(why, ms) {
+  if (reloadTimer) return;
+  stop(why);
+  var now = Date.now(), r = LS.get('vsr_reloads', []);
+  r.push({ t: now, why: why });
+  if (r.length > 60) r = r.slice(-60);
+  LS.set('vsr_reloads', r);
+  var recent = r.filter(function (x) { return now - x.t < 120000; }).length;
+  reloadTimer = setTimeout(function () { location.reload(); }, recent > 5 ? 30000 : (ms || 1000));
+}
+
+// ---------- WebGL ----------
+var canvas = document.getElementById('c');
+var gl = null, uRes, uTime, uSteps, uIter;
+var VS = 'attribute vec2 p;void main(){gl_Position=vec4(p,0.0,1.0);}';
+var FS = [
+'precision highp float;',
+'uniform vec2 uRes;uniform float uTime;uniform float uSteps;uniform float uIter;',
+'#define MAX_STEPS 256',
+'#define MAX_ITER 16',
+// 8 次幂 Mandelbulb：返回 1=内部，否则按逃逸速度给出 0~1
+'float bulb(vec3 p, out float trap){',
+'  vec3 z = p; trap = 1e4;',
+'  for (int i = 0; i < MAX_ITER; i++){',
+'    if (float(i) >= uIter) break;',
+'    float r = max(length(z), 1e-6);',
+'    if (r > 2.0) return float(i) / uIter;',
+'    float th = acos(clamp(z.z / r, -1.0, 1.0)) * 8.0;',
+'    float ph = atan(z.y, z.x + 1e-7) * 8.0;',
+'    z = pow(r, 8.0) * vec3(sin(th) * cos(ph), sin(th) * sin(ph), cos(th)) + p;',
+'    trap = min(trap, dot(z, z));',
+'  }',
+'  return 1.0;',
+'}',
+'void main(){',
+'  vec2 uv = (gl_FragCoord.xy * 2.0 - uRes) / min(uRes.x, uRes.y);',
+'  float a = uTime * 0.12;',
+'  vec3 ro = vec3(2.7 * sin(a), 0.8 * sin(a * 0.63), 2.7 * cos(a));',
+'  vec3 ww = normalize(-ro);',
+'  vec3 uu = normalize(cross(ww, vec3(0.0, 1.0, 0.0)));',
+'  vec3 vv = cross(uu, ww);',
+'  vec3 rd = normalize(uv.x * uu + uv.y * vv + 2.0 * ww);',
+'  vec3 col = vec3(0.015, 0.02, 0.035) * (1.0 - 0.3 * length(uv));',
+'  float b = dot(ro, rd);',
+'  float h = b * b - (dot(ro, ro) - 1.44);',
+'  if (h > 0.0){',
+'    h = sqrt(h);',
+'    float t0 = max(-b - h, 0.0), t1 = -b + h;',
+'    float dt = (t1 - t0) / uSteps;',
+'    float t = t0 + dt * fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);',
+'    vec3 acc = vec3(0.0); float alpha = 0.0;',
+// 固定步数、不提前退出：每帧负载恒定
+'    for (int i = 0; i < MAX_STEPS; i++){',
+'      if (float(i) >= uSteps) break;',
+'      vec3 p = ro + rd * t;',
+'      float trap;',
+'      float d = bulb(p, trap);',
+'      float dens = clamp(pow(d, 6.0) * 60.0 * dt, 0.0, 1.0);',
+'      vec3 c = 0.55 + 0.45 * cos(6.2831 * (vec3(0.0, 0.15, 0.30) + 0.35 * log(1.0 + trap) + 0.03 * uTime));',
+'      c *= 1.0 - 0.55 * (t - t0) / (t1 - t0);',
+'      float w = (1.0 - alpha) * dens;',
+'      acc += w * c; alpha += w; t += dt;',
+'    }',
+'    col = col * (1.0 - alpha) + acc;',
+'  }',
+'  gl_FragColor = vec4(sqrt(col), 1.0);',
+'}'
+].join('\n');
+
+function compile(type, src) {
+  var s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS) && !gl.isContextLost())
+    throw new Error(gl.getShaderInfoLog(s) || '着色器编译失败');
+  return s;
+}
+function initGL() {
+  gl = canvas.getContext('webgl', { antialias: false, alpha: false, depth: false, stencil: false,
+    preserveDrawingBuffer: false, powerPreference: 'high-performance' });
+  if (!gl) throw new Error('无法创建 WebGL 上下文');
+  var prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS) && !gl.isContextLost())
+    throw new Error(gl.getProgramInfoLog(prog) || '着色器链接失败');
+  gl.useProgram(prog);
+  gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  var loc = gl.getAttribLocation(prog, 'p');
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  uRes = gl.getUniformLocation(prog, 'uRes');
+  uTime = gl.getUniformLocation(prog, 'uTime');
+  uSteps = gl.getUniformLocation(prog, 'uSteps');
+  uIter = gl.getUniformLocation(prog, 'uIter');
+}
+
+var scale = cfg.scale || 0.4, steps = cfg.steps;
+function resize() {
+  var dpr = window.devicePixelRatio || 1;
+  var w = Math.max(64, Math.round(window.innerWidth * dpr * scale));
+  var h = Math.max(64, Math.round(window.innerHeight * dpr * scale));
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+}
+window.addEventListener('resize', resize);
+
+// ---------- 渲染循环与自动调负载 ----------
+var raf = 0, t0 = performance.now(), lastFrame = performance.now();
+var frames = 0, fpsWin = performance.now(), fps = 0;
+function frame(now) {
+  raf = requestAnimationFrame(frame);
+  lastFrame = performance.now();
+  if (!gl || gl.isContextLost()) return;
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.uniform2f(uRes, canvas.width, canvas.height);
+  gl.uniform1f(uTime, (now - t0) / 1000);
+  gl.uniform1f(uSteps, steps);
+  gl.uniform1f(uIter, cfg.iter);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  frames++;
+  var dt = now - fpsWin;
+  if (dt >= 2000) {
+    fps = frames * 1000 / dt; frames = 0; fpsWin = now;
+    adapt(); segBeat(); updateHud();
+  }
+}
+function adapt() { // 让帧率贴着目标值：说明 GPU 一直是瓶颈（满载），又不会单帧过长被系统判定卡死
+  if (cfg.scale) return;
+  var tg = cfg.fps;
+  if (fps > tg * 1.15) {
+    if (scale < 1) { scale = Math.min(1, scale * 1.12); resize(); }
+    else if (steps < 256) steps = Math.min(256, Math.round(steps * 1.15));
+  } else if (fps < tg * 0.8) {
+    if (steps > cfg.steps) steps = Math.max(cfg.steps, Math.round(steps / 1.15));
+    else if (scale > 0.15) { scale = Math.max(0.15, scale / 1.12); resize(); }
+    else if (steps > 24) steps = Math.max(24, Math.round(steps / 1.15));
+  }
+}
+
+// ---------- 屏幕常亮（Safari 16.4+，失败则依赖“自动锁定：永不”） ----------
+var lock = null;
+function wake() {
+  try {
+    if (!('wakeLock' in navigator) || document.hidden || (lock && !lock.released)) return;
+    navigator.wakeLock.request('screen').then(function (l) { lock = l; }, function () {});
+  } catch (e) {}
+}
+
+// ---------- 可选 CPU 负载 ----------
+var workers = [];
+var WK = 'var x=0;function spin(){var e=Date.now()+50;while(Date.now()<e){x=Math.sqrt(x+Math.sin(x)*Math.cos(x)+1.0001);}setTimeout(spin,0);}spin();';
+function cpuStart() {
+  if (!cfg.cpu || workers.length) return;
+  try {
+    var url = URL.createObjectURL(new Blob([WK], { type: 'text/javascript' }));
+    for (var i = 0; i < cfg.cpu; i++) workers.push(new Worker(url));
+  } catch (e) {}
+}
+function cpuStop() { workers.forEach(function (w) { try { w.terminate(); } catch (e) {} }); workers = []; }
+
+// ---------- 启停：页面可见就跑，进后台就停 ----------
+function start() {
+  if (document.hidden || raf || reloadTimer) return;
+  if (!gl || gl.isContextLost()) { reloadSoon('上下文丢失', 500); return; }
+  frames = 0; fpsWin = performance.now(); lastFrame = performance.now();
+  raf = requestAnimationFrame(frame);
+  segStart(); wake(); cpuStart(); updateHud();
+}
+function stop(why) {
+  if (raf) { cancelAnimationFrame(raf); raf = 0; }
+  segEnd(why); cpuStop(); updateHud();
+}
+document.addEventListener('visibilitychange', function () { if (document.hidden) stop(); else start(); });
+window.addEventListener('pageshow', function () { start(); });
+window.addEventListener('pagehide', function () { stop(); });
+canvas.addEventListener('webglcontextlost', function (e) { e.preventDefault(); reloadSoon('上下文丢失', 1500); });
+setInterval(function () { // 看门狗
+  if (document.hidden || reloadTimer) return;
+  if (raf && performance.now() - lastFrame > 10000) reloadSoon('画面卡住', 200);
+  else if (!raf) start();
+}, 3000);
+
+// ---------- 状态面板（点一下展开/收起） ----------
+var hud = document.getElementById('hud'), sumEl = document.getElementById('sum'), logEl = document.getElementById('log');
+if (!cfg.hud) hud.style.display = 'none';
+hud.addEventListener('click', function () { hud.classList.toggle('min'); updateHud(); });
+document.getElementById('clr').addEventListener('click', function (e) {
+  e.stopPropagation(); ['vsr_log', 'vsr_reloads'].forEach(LS.del); updateHud();
+});
+function pad(n) { return ('0' + n).slice(-2); }
+function dur(ms) { var m = Math.round(ms / 60000); return Math.floor(m / 60) + 'h' + pad(m % 60) + 'm'; }
+function hm(t) { var d = new Date(t); return (d.getMonth() + 1) + '/' + d.getDate() + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()); }
+function runs() { // 合并因重载切开的相邻时段，只显示 ≥2 分钟的
+  var log = LS.get('vsr_log', []).slice();
+  if (seg) log.push({ s: seg.start, e: Date.now(), f: '进行中' });
+  var out = [];
+  log.forEach(function (x) {
+    var p = out[out.length - 1];
+    if (p && x.s - p.e < 90000) { p.e = x.e; p.f = x.f; } else out.push({ s: x.s, e: x.e, f: x.f });
+  });
+  return out.filter(function (x) { return x.e - x.s >= 120000; });
+}
+function updateHud() {
+  if (!cfg.hud) return;
+  var reloads = LS.get('vsr_reloads', []).length;
+  sumEl.textContent =
+    'Fractal View · ' + (raf ? '运行中' : '已暂停') + '\n' +
+    'FPS ' + fps.toFixed(1) + ' · ' + canvas.width + '×' + canvas.height +
+    ' (缩放 ' + scale.toFixed(2) + ') · 步数 ' + steps + ' · 迭代 ' + cfg.iter +
+    (cfg.cpu ? ' · CPU×' + cfg.cpu : '') + '\n' +
+    '本段已运行 ' + (seg ? dur(Date.now() - seg.start) : '-') + ' · 自动重载 ' + reloads + ' 次' +
+    (hud.classList.contains('min') ? '\n（点此查看每轮放电时长）' : '');
+  if (!hud.classList.contains('min')) {
+    var r = runs().slice(-12).reverse();
+    logEl.textContent = '\n最近的运行时段（≈ 每轮放电）：\n' + (r.length ? r.map(function (x) {
+      return hm(x.s) + ' → ' + hm(x.e).split(' ')[1] + '  ' + dur(x.e - x.s) + (x.f ? '  [' + x.f + ']' : '');
+    }).join('\n') : '（暂无）');
+  }
+}
+
+// ---------- 启动 ----------
+function showMsg(t) { var m = document.getElementById('msg'); m.textContent = t; m.style.display = 'flex'; }
+try { initGL(); resize(); start(); updateHud(); }
+catch (e) {
+  showMsg('启动失败：' + e.message + '\n30 秒后自动重试');
+  setTimeout(function () { location.reload(); }, 30000);
+}
+})();
+</script>
+</body>
+</html>
